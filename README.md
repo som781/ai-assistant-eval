@@ -119,11 +119,13 @@ Guardrail calls (input classifier, output toxicity, compression) are latency-sen
 
 | Decision | What we gained | What we gave up |
 |----------|---------------|-----------------|
-| HF Inference API (no GPU) | Zero infra cost | Higher latency, rate limits |
-| Prompt-based tool use for OSS | No fine-tuning needed | Unreliable JSON parsing |
+| Self-hosted Qwen2.5-0.5B via `transformers` | Zero per-token cost, runs offline, matches HF Spaces deploy | ~1 GB model download, local compute |
+| Prompt-based tool use for OSS | No fine-tuning needed; works via a parse → execute → re-generate loop | The 0.5B model triggers tools inconsistently (see note below) |
 | GPT-4o-mini for guards | Fast + cheap | Slightly less accurate than GPT-4.1 |
 | Stub web search | No API key needed | Not a real search result |
 | In-memory session state | Simple, no DB | State lost on page refresh |
+
+**Note on OSS tool use:** the tool-call machinery (parse JSON → execute → feed result back → regenerate in natural language) is fully implemented and verified. However, Qwen2.5-**0.5B** is small enough that it doesn't reliably *decide* when to call `get_current_date` — it tends to either over-call or skip it. A conservative system prompt curbs the over-calling. The frontier assistant (GPT-4.1) uses native function calling and invokes tools reliably. A larger OSS model (3B+) would close most of this gap.
 
 ## What I'd Improve With More Time
 

@@ -26,16 +26,19 @@ TOOL_SCHEMAS = [
 ]
 
 # OSS prompt-based tool descriptions (injected into system prompt)
-OSS_TOOL_PROMPT = """TOOLS:
-1. get_current_date() — returns today's date
-2. search_web_stub(query: str) — returns a web search summary (demo only)
+OSS_TOOL_PROMPT = """You can optionally use these tools:
+1. get_current_date() — only when the user asks about today's date or the current day.
+2. search_web_stub(query) — only when the user explicitly asks to search the web.
 
-To use a tool, respond ONLY with JSON on a single line:
+Answer DIRECTLY for everything else — math, general knowledge, definitions,
+explanations, and conversation. Do NOT use a tool for those.
+
+ONLY if a tool is genuinely required, respond with a single line of JSON and nothing else:
 {"tool": "get_current_date"}
 or
 {"tool": "search_web_stub", "query": "your search query"}
 
-After receiving a tool result, answer the user naturally."""
+After a tool result is provided, reply in plain natural language (never JSON)."""
 
 
 def get_current_date() -> str:

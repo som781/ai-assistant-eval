@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
+import json
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from assistants.base import BaseAssistant
-from tools.assistant_tools import OSS_TOOL_PROMPT
+from tools.assistant_tools import OSS_TOOL_PROMPT, dispatch_tool
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -21,6 +23,23 @@ def _pick_device() -> str:
     return "cpu"
 
 
+def _try_parse_tool_call(text: str) -> dict | None:
+    """Return a tool-call dict if the model emitted one as JSON, else None."""
+    text = text.strip()
+    candidates = [text]
+    m = re.search(r"\{.*?\}", text, re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+    for c in candidates:
+        try:
+            obj = json.loads(c)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "tool" in obj:
+            return obj
+    return None
+
+
 class OSSAssistant(BaseAssistant):
     def __init__(self):
         self._device = _pick_device()
@@ -35,11 +54,8 @@ class OSSAssistant(BaseAssistant):
     def get_cost_per_1k_tokens(self) -> dict:
         return {"input": 0.0, "output": 0.0}  # self-hosted — no per-token cost
 
-    def chat(self, message: str, history: list[dict]) -> dict:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": message})
-
+    def _generate(self, messages: list[dict]) -> tuple[str, int, int, float]:
+        """One generation pass. Returns (text, tokens_in, tokens_out, latency_ms)."""
         text = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -56,15 +72,44 @@ class OSSAssistant(BaseAssistant):
             )
         latency_ms = (time.time() - t0) * 1000
 
-        # Strip the prompt tokens; decode only the newly generated portion.
         prompt_len = inputs.input_ids.shape[1]
         output_ids = generated[0][prompt_len:]
-        response_text = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        out_text = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        return out_text, int(prompt_len), int(output_ids.shape[0]), latency_ms
+
+    def chat(self, message: str, history: list[dict]) -> dict:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": message})
+
+        out_text, tokens_in, tokens_out, latency_ms = self._generate(messages)
+
+        # Prompt-based tool use: if the model emitted a tool call, execute it and
+        # feed the result back for a second, natural-language generation.
+        tool_call = _try_parse_tool_call(out_text)
+        if tool_call:
+            tool_name = tool_call.get("tool", "")
+            args = {k: v for k, v in tool_call.items() if k != "tool"}
+            tool_result = dispatch_tool(tool_name, args)
+
+            messages.append({"role": "assistant", "content": out_text})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Tool '{tool_name}' returned: {tool_result}\n"
+                    "Use this to answer my previous question in natural language. "
+                    "Do not output JSON."
+                ),
+            })
+            out_text, t_in2, t_out2, lat2 = self._generate(messages)
+            tokens_in += t_in2
+            tokens_out += t_out2
+            latency_ms += lat2
 
         return {
-            "response": response_text,
-            "tokens_in": int(prompt_len),
-            "tokens_out": int(output_ids.shape[0]),
+            "response": out_text,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
             "latency_ms": latency_ms,
             "cost_usd": 0.0,
         }
@@ -73,7 +118,7 @@ class OSSAssistant(BaseAssistant):
 if __name__ == "__main__":
     assistant = OSSAssistant()
     history = []
-    for user_msg in ["Hi, what can you do?", "What is the capital of France?", "Thanks!"]:
+    for user_msg in ["Hi, what can you do?", "What is 2 + 2?", "What is today's date?"]:
         print(f"User: {user_msg}")
         result = assistant.chat(user_msg, history)
         print(f"Assistant: {result['response']}")

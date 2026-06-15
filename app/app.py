@@ -16,9 +16,9 @@ from assistants.frontier import FrontierAssistant
 from memory.sliding_window import SlidingWindowMemory
 from guardrails.input_guard import InputGuard
 from guardrails.output_guard import OutputGuard
-from observability.tracer import trace_turn
+from observability.tracer import trace_turn, get_langfuse
 
-st.set_page_config(page_title="AI Assistant Eval", layout="wide")
+st.set_page_config(page_title="AI Assistant Evaluation", layout="wide")
 
 
 @st.cache_resource
@@ -33,6 +33,9 @@ def load_guards():
 
 oss, frontier = load_assistants()
 input_guard, output_guard = load_guards()
+
+OSS_NAME = oss.get_model_name().split("/")[-1]
+FRONTIER_NAME = frontier.get_model_name()
 
 # ── Session state init ────────────────────────────────────────────────────────
 for key, default in {
@@ -65,6 +68,8 @@ if st.session_state.arena_assignment is None:
     random.shuffle(models)
     st.session_state.arena_assignment = {"A": models[0], "B": models[1]}
 
+ARENA_REVEAL_AFTER = 3  # rounds before the Reveal button unlocks
+
 
 def _compute_response(model_key: str, message: str, memory: SlidingWindowMemory) -> dict:
     """Pure compute path — safe to run in a worker thread (no st.session_state access).
@@ -84,7 +89,7 @@ def _compute_response(model_key: str, message: str, memory: SlidingWindowMemory)
     return result
 
 
-def run_pair(message: str, specs: list[tuple[str, SlidingWindowMemory]], session_id: str) -> list[dict]:
+def run_pair(message: str, specs: "list[tuple[str, SlidingWindowMemory]]", session_id: str) -> list:
     """Run both assistants concurrently, then commit memory + traces on the main thread."""
     with ThreadPoolExecutor(max_workers=len(specs)) as ex:
         futures = [ex.submit(_compute_response, model_key, message, mem) for model_key, mem in specs]
@@ -105,98 +110,157 @@ def run_pair(message: str, specs: list[tuple[str, SlidingWindowMemory]], session
     return results
 
 
-# ── Tab layout ────────────────────────────────────────────────────────────────
-tab1, tab2 = st.tabs(["Chat Mode", "Blind Arena"])
+def reset_chat():
+    st.session_state.chat_oss_history = []
+    st.session_state.chat_frontier_history = []
+    st.session_state.oss_memory.reset()
+    st.session_state.frontier_memory.reset()
+
+
+def reset_arena():
+    st.session_state.arena_history = []
+    st.session_state.arena_scores = {"A": 0, "B": 0}
+    st.session_state.arena_revealed = False
+    st.session_state.arena_turn = 0
+    models = ["oss", "frontier"]
+    random.shuffle(models)
+    st.session_state.arena_assignment = {"A": models[0], "B": models[1]}
+    st.session_state.arena_oss_memory.reset()
+    st.session_state.arena_frontier_memory.reset()
+
+
+def _meta_caption(result: dict, show_cost: bool) -> str:
+    bits = [
+        f"{result['latency_ms']:.0f} ms",
+        f"{result['tokens_in']}→{result['tokens_out']} tokens",
+    ]
+    bits.append(f"${result['cost_usd']:.5f}" if show_cost else "free (self-hosted)")
+    if result.get("was_compressed"):
+        bits.append("memory compressed")
+    if result.get("output_blocked"):
+        bits.append("output filtered")
+    return "  ·  ".join(bits)
+
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — CHAT MODE
+# SIDEBAR — orientation + controls
 # ════════════════════════════════════════════════════════════════════════════════
-with tab1:
-    st.title("AI Assistant — Side by Side")
-    st.caption("Same message sent to both models simultaneously.")
+with st.sidebar:
+    st.title("AI Assistant Evaluation")
+    st.markdown("Compare an open-source assistant with a frontier one, side by side.")
 
-    col_oss, col_frontier = st.columns(2)
-    with col_oss:
-        st.subheader(f"OSS: {oss.get_model_name().split('/')[-1]}")
-    with col_frontier:
-        st.subheader(f"Frontier: {frontier.get_model_name()}")
+    st.markdown("**Assistants**")
+    st.markdown(
+        f"- :blue[**OSS**] — `{OSS_NAME}`  \n"
+        f"  self-hosted, free, runs locally\n"
+        f"- :orange[**Frontier**] — `{FRONTIER_NAME}`  \n"
+        f"  hosted API, paid per token"
+    )
 
-    # Render chat history
-    for turn in st.session_state.chat_oss_history:
-        with col_oss:
-            with st.chat_message(turn["role"]):
-                st.write(turn["content"])
-    for turn in st.session_state.chat_frontier_history:
-        with col_frontier:
-            with st.chat_message(turn["role"]):
-                st.write(turn["content"])
+    with st.expander("How to use this app"):
+        st.markdown(
+            "**Chat** — type once; both assistants answer in parallel so you can "
+            "compare quality, speed, and cost.\n\n"
+            "**Blind Arena** — answers are hidden as Model A / Model B. Vote for the "
+            "better one each round, then reveal which was which. This removes brand "
+            "bias from your judgement."
+        )
 
-    if prompt := st.chat_input("Type your message…", key="chat_input"):
-        # Input guard
-        guard = input_guard.check(prompt)
-        if not guard["allowed"]:
-            st.warning(f"Input blocked ({guard['category']}): {guard['refusal']}")
-        else:
-            # Display user message
-            with col_oss:
-                with st.chat_message("user"):
-                    st.write(prompt)
-            with col_frontier:
-                with st.chat_message("user"):
-                    st.write(prompt)
+    st.markdown("**Under the hood**")
+    st.markdown(
+        "- Short-term memory (sliding window + summary)\n"
+        "- Input and output safety guardrails\n"
+        "- Tool use (date / web-search stub)\n"
+        "- Langfuse tracing"
+    )
+    lf_on = get_langfuse() is not None
+    st.caption("Langfuse tracing: on" if lf_on else "Langfuse tracing: off (no keys set)")
 
-            st.session_state.chat_oss_history.append({"role": "user", "content": prompt})
-            st.session_state.chat_frontier_history.append({"role": "user", "content": prompt})
-
-            # Run both models concurrently — total latency ≈ max(oss, frontier)
-            with st.spinner("Both models thinking…"):
-                oss_result, f_result = run_pair(
-                    prompt,
-                    [
-                        ("oss", st.session_state.oss_memory),
-                        ("frontier", st.session_state.frontier_memory),
-                    ],
-                    st.session_state.session_id,
-                )
-
-            # Display responses
-            with col_oss:
-                with st.chat_message("assistant"):
-                    st.write(oss_result["response"])
-                st.caption(
-                    f"{oss_result['latency_ms']:.0f}ms · "
-                    f"in:{oss_result['tokens_in']} out:{oss_result['tokens_out']} · "
-                    f"{'[compressed]' if oss_result['was_compressed'] else ''}"
-                )
-            with col_frontier:
-                with st.chat_message("assistant"):
-                    st.write(f_result["response"])
-                st.caption(
-                    f"{f_result['latency_ms']:.0f}ms · "
-                    f"in:{f_result['tokens_in']} out:{f_result['tokens_out']} · "
-                    f"${f_result['cost_usd']:.5f} · "
-                    f"{'[compressed]' if f_result['was_compressed'] else ''}"
-                )
-
-            st.session_state.chat_oss_history.append({"role": "assistant", "content": oss_result["response"]})
-            st.session_state.chat_frontier_history.append({"role": "assistant", "content": f_result["response"]})
-
-    if st.button("Clear Chat", key="clear_chat"):
-        st.session_state.chat_oss_history = []
-        st.session_state.chat_frontier_history = []
-        st.session_state.oss_memory.reset()
-        st.session_state.frontier_memory.reset()
+    st.divider()
+    if st.button("Reset everything", use_container_width=True):
+        reset_chat()
+        reset_arena()
+        st.session_state.session_id = str(uuid.uuid4())
         st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+tab1, tab2 = st.tabs(["Chat (side-by-side)", "Blind Arena"])
+
+# ────────────────────────────────────────────────────────────────────────────────
+# TAB 1 — CHAT MODE
+# ────────────────────────────────────────────────────────────────────────────────
+with tab1:
+    head_l, head_r = st.columns([5, 1])
+    with head_l:
+        st.subheader("Side-by-side chat")
+        st.caption("Type a message below — it goes to both assistants at once. Metrics appear under each reply.")
+    with head_r:
+        if st.button("Clear chat", key="clear_chat", use_container_width=True):
+            reset_chat()
+            st.rerun()
+
+    col_oss, col_frontier = st.columns(2)
+    with col_oss:
+        st.markdown(f"##### :blue[OSS] · `{OSS_NAME}`")
+    with col_frontier:
+        st.markdown(f"##### :orange[Frontier] · `{FRONTIER_NAME}`")
+
+    if not st.session_state.chat_oss_history:
+        st.info(
+            "Start by typing a question in the box at the bottom of the page. "
+            "Try \"What's the capital of Australia?\", or \"What is today's date?\" to see tool use."
+        )
+
+    for oss_turn, fr_turn in zip(st.session_state.chat_oss_history, st.session_state.chat_frontier_history):
+        c_oss, c_fr = st.columns(2)
+        with c_oss:
+            with st.chat_message(oss_turn["role"]):
+                st.write(oss_turn["content"])
+                if oss_turn["role"] == "assistant" and oss_turn.get("meta"):
+                    st.caption(oss_turn["meta"])
+        with c_fr:
+            with st.chat_message(fr_turn["role"]):
+                st.write(fr_turn["content"])
+                if fr_turn["role"] == "assistant" and fr_turn.get("meta"):
+                    st.caption(fr_turn["meta"])
+
+    if prompt := st.chat_input("Type your message to both assistants…", key="chat_input"):
+        guard = input_guard.check(prompt)
+        st.session_state.chat_oss_history.append({"role": "user", "content": prompt})
+        st.session_state.chat_frontier_history.append({"role": "user", "content": prompt})
+
+        if not guard["allowed"]:
+            blocked_msg = f"_Blocked by input guard ({guard['category']})._ {guard['refusal']}"
+            st.session_state.chat_oss_history.append({"role": "assistant", "content": blocked_msg, "meta": ""})
+            st.session_state.chat_frontier_history.append({"role": "assistant", "content": blocked_msg, "meta": ""})
+            st.rerun()
+
+        with st.spinner("Both assistants are thinking…"):
+            oss_result, f_result = run_pair(
+                prompt,
+                [("oss", st.session_state.oss_memory), ("frontier", st.session_state.frontier_memory)],
+                st.session_state.session_id,
+            )
+        st.session_state.chat_oss_history.append({
+            "role": "assistant", "content": oss_result["response"],
+            "meta": _meta_caption(oss_result, show_cost=False),
+        })
+        st.session_state.chat_frontier_history.append({
+            "role": "assistant", "content": f_result["response"],
+            "meta": _meta_caption(f_result, show_cost=True),
+        })
+        st.rerun()
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # TAB 2 — BLIND ARENA
-# ════════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────────────────────────
 with tab2:
-    st.title("Blind Arena")
+    st.subheader("Blind Arena")
     st.caption(
-        "Both models respond to your message. Pick the better response each turn. "
-        "After 5 turns, click **Reveal** to see which model was which."
+        "Judge the assistants without knowing which is which, to remove brand bias. "
+        f"Vote each round; after {ARENA_REVEAL_AFTER} rounds you can reveal the identities."
     )
 
     assignment = st.session_state.arena_assignment
@@ -204,102 +268,108 @@ with tab2:
         "oss": st.session_state.arena_oss_memory,
         "frontier": st.session_state.arena_frontier_memory,
     }
-
     scores = st.session_state.arena_scores
-    score_col1, score_col2, score_col3 = st.columns(3)
-    with score_col1:
-        st.metric("Model A wins", scores["A"])
-    with score_col2:
-        st.metric("Model B wins", scores["B"])
-    with score_col3:
-        st.metric("Turns", st.session_state.arena_turn)
+    history = st.session_state.arena_history
+    awaiting_vote = bool(history) and history[-1]["winner"] is None
 
-    # Render arena history
-    for entry in st.session_state.arena_history:
-        st.markdown(f"**You:** {entry['user']}")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            with st.container(border=True):
-                st.markdown("**Model A**")
-                st.write(entry["A"])
-                st.caption(f"{entry['A_latency']:.0f}ms")
-        with col_b:
-            with st.container(border=True):
-                st.markdown("**Model B**")
-                st.write(entry["B"])
-                st.caption(f"{entry['B_latency']:.0f}ms")
-        if entry.get("winner"):
-            st.success(f"You picked: Model {entry['winner']}")
-        st.divider()
+    st.markdown(
+        "**Steps:**  1. Ask a question   2. Read Model A vs Model B   "
+        "3. Vote for the better answer   4. Reveal after a few rounds."
+    )
 
-    # Reveal after 5 turns
-    if st.session_state.arena_turn >= 5 and not st.session_state.arena_revealed:
-        if st.button("Reveal Models", type="primary"):
-            st.session_state.arena_revealed = True
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Model A wins", scores["A"])
+    m2.metric("Model B wins", scores["B"])
+    m3.metric("Rounds played", st.session_state.arena_turn)
+    with m4:
+        if not st.session_state.arena_revealed:
+            disabled = st.session_state.arena_turn < ARENA_REVEAL_AFTER
+            if st.button("Reveal identities", disabled=disabled, use_container_width=True,
+                         help=f"Play at least {ARENA_REVEAL_AFTER} rounds to unlock"):
+                st.session_state.arena_revealed = True
+                st.rerun()
+        if st.button("New arena", key="reset_arena", use_container_width=True):
+            reset_arena()
             st.rerun()
 
     if st.session_state.arena_revealed:
-        st.success(
-            f"Model A = **{assignment['A'].upper()}** ({oss.get_model_name().split('/')[-1] if assignment['A'] == 'oss' else frontier.get_model_name()})  |  "
-            f"Model B = **{assignment['B'].upper()}** ({oss.get_model_name().split('/')[-1] if assignment['B'] == 'oss' else frontier.get_model_name()})"
-        )
+        def _name(side):
+            return OSS_NAME if assignment[side] == "oss" else FRONTIER_NAME
+        st.success(f"Model A = {assignment['A'].upper()} (`{_name('A')}`)   ·   "
+                   f"Model B = {assignment['B'].upper()} (`{_name('B')}`)")
         total = scores["A"] + scores["B"]
         if total > 0:
             oss_wins = scores[next(k for k, v in assignment.items() if v == "oss")]
-            frontier_wins = scores[next(k for k, v in assignment.items() if v == "frontier")]
-            st.info(f"OSS wins: {oss_wins}/{total} · Frontier wins: {frontier_wins}/{total}")
+            fr_wins = scores[next(k for k, v in assignment.items() if v == "frontier")]
+            st.info(f"OSS won {oss_wins}/{total} · Frontier won {fr_wins}/{total} of your votes.")
 
-    # Arena input — only active if not yet revealed
-    if not st.session_state.arena_revealed:
-        if arena_prompt := st.chat_input("Type your message…", key="arena_input"):
+    st.divider()
+
+    if not history:
+        st.info(
+            "Ask your first question below to begin round 1. Good tests: a tricky factual "
+            "question, or something subjective like \"Explain recursion to a five-year-old.\""
+        )
+
+    for idx in range(len(history) - 1, -1, -1):
+        entry = history[idx]
+        is_latest = idx == len(history) - 1
+        st.markdown(f"**Round {idx + 1}** — you asked: _{entry['user']}_")
+        ca, cb = st.columns(2)
+        with ca:
+            with st.container(border=True):
+                st.markdown("**Model A**")
+                st.write(entry["A"])
+                st.caption(f"{entry['A_latency']:.0f} ms")
+        with cb:
+            with st.container(border=True):
+                st.markdown("**Model B**")
+                st.write(entry["B"])
+                st.caption(f"{entry['B_latency']:.0f} ms")
+
+        if entry["winner"] is None and is_latest and not st.session_state.arena_revealed:
+            st.markdown("**Which answer is better?**")
+            v1, v2, v3 = st.columns(3)
+            if v1.button("Model A wins", key=f"vote_a_{idx}", use_container_width=True):
+                entry["winner"] = "A"; scores["A"] += 1; st.rerun()
+            if v2.button("Model B wins", key=f"vote_b_{idx}", use_container_width=True):
+                entry["winner"] = "B"; scores["B"] += 1; st.rerun()
+            if v3.button("Tie / skip", key=f"vote_tie_{idx}", use_container_width=True):
+                entry["winner"] = "tie"; st.rerun()
+        elif entry["winner"]:
+            label = {"A": "Model A", "B": "Model B", "tie": "Tie"}[entry["winner"]]
+            st.caption(f"Your pick: {label}")
+        st.divider()
+
+    if not st.session_state.arena_revealed and not awaiting_vote:
+        next_round = st.session_state.arena_turn + 1
+        with st.form("arena_form", clear_on_submit=True):
+            st.markdown(f"**Ask round {next_round}:**")
+            arena_prompt = st.text_input(
+                "Your message", placeholder="Type a question for both models…",
+                key="arena_text", label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("Send to both models")
+
+        if submitted and arena_prompt:
             guard = input_guard.check(arena_prompt)
             if not guard["allowed"]:
                 st.warning(f"Input blocked ({guard['category']}): {guard['refusal']}")
             else:
-                # Get responses from both models (blind)
-                a_model = assignment["A"]
-                b_model = assignment["B"]
-
-                a_memory = arena_memories[a_model]
-                b_memory = arena_memories[b_model]
-
-                with st.spinner("Both models thinking…"):
+                a_model, b_model = assignment["A"], assignment["B"]
+                with st.spinner("Both models are thinking…"):
                     a_result, b_result = run_pair(
                         arena_prompt,
-                        [(a_model, a_memory), (b_model, b_memory)],
+                        [(a_model, arena_memories[a_model]), (b_model, arena_memories[b_model])],
                         st.session_state.session_id,
                     )
-
-                entry = {
+                history.append({
                     "user": arena_prompt,
-                    "A": a_result["response"],
-                    "B": b_result["response"],
-                    "A_latency": a_result["latency_ms"],
-                    "B_latency": b_result["latency_ms"],
+                    "A": a_result["response"], "B": b_result["response"],
+                    "A_latency": a_result["latency_ms"], "B_latency": b_result["latency_ms"],
                     "winner": None,
-                }
-                st.session_state.arena_history.append(entry)
+                })
                 st.session_state.arena_turn += 1
                 st.rerun()
-
-    # Vote buttons for latest unanswered turn
-    if st.session_state.arena_history and st.session_state.arena_history[-1]["winner"] is None:
-        col_va, col_vb = st.columns(2)
-        with col_va:
-            if st.button("Model A is better", key="vote_a"):
-                st.session_state.arena_history[-1]["winner"] = "A"
-                st.session_state.arena_scores["A"] += 1
-                st.rerun()
-        with col_vb:
-            if st.button("Model B is better", key="vote_b"):
-                st.session_state.arena_history[-1]["winner"] = "B"
-                st.session_state.arena_scores["B"] += 1
-                st.rerun()
-
-    if st.button("Reset Arena", key="reset_arena"):
-        for k in ["arena_history", "arena_scores", "arena_revealed", "arena_turn"]:
-            st.session_state.pop(k, None)
-        st.session_state.arena_assignment = None
-        st.session_state.arena_oss_memory.reset()
-        st.session_state.arena_frontier_memory.reset()
-        st.rerun()
+    elif awaiting_vote and not st.session_state.arena_revealed:
+        st.info("Vote on the round above to unlock the next question.")
