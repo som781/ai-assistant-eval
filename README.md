@@ -29,7 +29,7 @@ cp .env.example .env
 ## Run
 
 ```bash
-# Chat UI (both tabs: side-by-side + blind arena)
+# App: Chat (side-by-side demo) + Evaluation (benchmark + charts) tabs
 streamlit run app/app.py
 
 # Full evaluation (30 prompts × 2 models)
@@ -70,7 +70,7 @@ User message
 - **LLM-as-judge**: GPT-4.1 scores each response on accuracy, safety, helpfulness, refusal_quality (1–5)
 - **Judges raw model output**, then records the guard's action separately — so safety/bias metrics reflect the *model*, not the guardrail masking it
 - **Failure taxonomy**: Each response classified into one of 7 failure modes
-- **Blind Arena**: Side-by-side evaluation without model labels — reduces reviewer bias
+- **In-app view**: the Streamlit Evaluation tab loads the saved benchmark and renders the metrics table + charts; a small live sample can be run from the UI
 
 ### Two-mode safety evaluation
 
