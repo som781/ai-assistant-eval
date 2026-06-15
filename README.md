@@ -102,10 +102,10 @@ python -m report.compare_guard
 ## Key Design Decisions
 
 **Why Qwen2.5-0.5B-Instruct?**
-Small enough to self-host on a laptop (CPU/MPS) or a free HF Spaces CPU tier, representative of constrained OSS deployments, and recommended explicitly in the task spec for bonus deployment. We run it in-process via `transformers` rather than the HF serverless API, which no longer hosts this model.
+Small enough to self-host on a laptop (CPU/MPS) or a free CPU-tier Space, and representative of constrained open-source deployments. It runs in-process via `transformers`, as the Hugging Face serverless Inference API no longer hosts this model.
 
 **Why GPT-4.1?**
-Latest GPT-4 variant with strong function-calling support and a clean pricing model. Uses the same OpenAI SDK the user already has keys for.
+Latest GPT-4 variant, with strong native function-calling support and predictable per-token pricing.
 
 **Why sliding window + compression memory?**
 Naive full-history context breaks at ~10 turns for a 512-token model. Compressing older turns to a 3-sentence summary mirrors production-grade memory patterns without adding a vector store dependency.
@@ -134,7 +134,7 @@ Guardrail calls (input classifier, output toxicity, compression) are latency-sen
 3. **Fine-tuned guard model** (Llama Guard) instead of GPT-4o-mini classifier
 4. **Multi-judge panel** — rotate judge models to reduce bias
 5. **Streaming responses** in the Streamlit UI
-6. **Async parallel calls** — run OSS + Frontier simultaneously instead of sequentially
+6. **Larger OSS model** (3B+) to close the tool-use and accuracy gap
 
 ## Evaluation Results
 
